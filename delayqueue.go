@@ -151,7 +151,9 @@ func (dq *DelayQueue) EnQueue(value interface{}, delay int64) {
 // Receive returns a received only channel, which can be used for receiving value left from queue
 func (dq *DelayQueue) Receive() <-chan interface{} {
 	if dq.delay == nil {
+		dq.rw.RLock()
 		dq.delay = make(chan interface{})
+		dq.rw.RUnlock()
 	}
 	return dq.delay
 }
