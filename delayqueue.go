@@ -29,11 +29,7 @@ type DelayQueue struct {
 type TravFunc func(interface{})
 
 func (dq *DelayQueue) delayService() {
-	var (
-		elem, end    *list.Element
-		item         *dqItem
-		releaseRLock bool
-	)
+	var releaseRLock bool
 
 	for {
 		dq.rw.RLock()
@@ -53,11 +49,7 @@ func (dq *DelayQueue) delayService() {
 			<-dq.reconsumption
 		}
 
-		elem = dq.queue.Front()
-		end = elem.Next()
-		item = elem.Value.(*dqItem)
-
-		if time.Now().Before(item.expire) {
+		if time.Now().Before(dq.queue.Front().Value.(*dqItem).expire) {
 			dq.rw.RUnlock()
 			releaseRLock = true
 
@@ -65,10 +57,8 @@ func (dq *DelayQueue) delayService() {
 			case <-dq.reconsumption:
 				if time.Now().Before(dq.queue.Front().Value.(*dqItem).expire) {
 					continue
-				} else if time.Now().Before(item.expire) {
-					end = elem
 				}
-			case <-time.After(item.expire.Sub(time.Now())):
+			case <-time.After(dq.queue.Front().Value.(*dqItem).expire.Sub(time.Now())):
 				if len(dq.reconsumption) > 0 {
 					<-dq.reconsumption
 				}
@@ -85,7 +75,7 @@ func (dq *DelayQueue) delayService() {
 			<-dq.reconsumption
 		}
 
-		for front := dq.queue.Front(); front != end; front = dq.queue.Front() {
+		for front := dq.queue.Front(); front != nil && front.Value.(*dqItem).expire.Before(time.Now()); front = dq.queue.Front() {
 			if dq.delay != nil {
 				dq.delay <- front.Value.(*dqItem).value
 			}
