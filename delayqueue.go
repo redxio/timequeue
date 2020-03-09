@@ -97,9 +97,9 @@ func New() *DelayQueue {
 	return dq
 }
 
-// EnQueue enters delay queue, stay in queue for delay milliseconds then leave immediately, it will leave immediately if delay less or equal than 0.
-func (dq *DelayQueue) EnQueue(value interface{}, delay int64) {
-	expireTime := time.Now().Add(time.Millisecond * time.Duration(delay))
+// EnQueue enters delay queue, stay in queue for duration delay then leave immediately, it will leave immediately if delay less or equal than 0.
+func (dq *DelayQueue) EnQueue(value interface{}, delay time.Duration) {
+	expireTime := time.Now().Add(delay)
 
 	if delay <= 0 {
 		if dq.delay != nil {
