@@ -9,7 +9,7 @@ type encoder struct {
 	buf           *bytes.Buffer
 	in            chan *node
 	out           chan []byte
-	done          chan semaphore
+	worker        *semaphore
 }
 
 func newEncoder() *encoder {
@@ -20,18 +20,26 @@ func newEncoder() *encoder {
 		buf:           buf,
 		in:            make(chan *node),
 		out:           make(chan []byte),
-		done:          make(chan semaphore),
 	}
 }
 
 func (enc *encoder) service() {
-	for n := range enc.in {
-		if err := enc.binaryEncoder.encode(n.item); err != nil {
-			panic(err)
-		}
 
-		enc.out <- enc.buf.Bytes()
-		<-enc.done
-		enc.buf.Reset()
+	for {
+		select {
+		case n := <-enc.in:
+			if err := enc.binaryEncoder.encode(n.item); err != nil {
+				panic(err)
+			}
+
+			enc.out <- enc.buf.Bytes()
+			enc.worker.peek(done)
+			enc.buf.Reset()
+
+		case *enc.worker.addr() = <-enc.worker.channel():
+			if enc.worker.expect(stop) {
+				return
+			}
+		}
 	}
 }

@@ -47,6 +47,7 @@ type persistence struct {
 	osSignal      chan os.Signal
 	value         interface{}
 	registry      map[string]interface{}
+	worker        *semaphore
 }
 
 func newPersistence() *persistence {
@@ -194,24 +195,35 @@ func (tq *TimeQueue) withPersistence(filename string, maxExpired int64, value in
 		return errors.New("maximum expired length is less than 0")
 	}
 
-	f, err := createOrOpenFile(filename)
+	file, err := createOrOpenFile(filename)
 	if err != nil {
 		return err
 	}
 
-	p := newPersistence()
-	p.maxExpired = maxExpired
-	p.file = f
-	p.value = value
-	p.registry = registry
-	p.encoder = newEncoder()
+	persistence := newPersistence()
+	encoder := newEncoder()
 
-	tq.persistence = p
+	pWorker := newSemaphore(0)
+	eWorker := newSemaphore(0)
+
+	pWorker.broadcastTo(eWorker, done)
+	pWorker.broadcastTo(eWorker, stop)
+
+	persistence.worker = pWorker
+	encoder.worker = eWorker
+
+	persistence.file = file
+	persistence.value = value
+	persistence.encoder = encoder
+	persistence.registry = registry
+	persistence.maxExpired = maxExpired
+
+	tq.persistence = persistence
 	tq.persistent = true
 
-	signal.Notify(p.osSignal, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(persistence.osSignal, syscall.SIGINT, syscall.SIGTERM)
 
-	fileSize, err := p.getFileSize()
+	fileSize, err := persistence.getFileSize()
 	if err != nil {
 		return err
 	}
@@ -222,7 +234,7 @@ func (tq *TimeQueue) withPersistence(filename string, maxExpired int64, value in
 		}
 
 		if fileSize >= fileMetaInfoLength {
-			mMap, err := syscall.Mmap(int(p.file.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
+			mMap, err := syscall.Mmap(int(persistence.file.Fd()), 0, int(fileSize), syscall.PROT_READ, syscall.MAP_SHARED)
 			if err != nil {
 				return err
 			}
@@ -235,13 +247,13 @@ func (tq *TimeQueue) withPersistence(filename string, maxExpired int64, value in
 			}
 
 			if expiredLength > 0 {
-				p.expiredLength = expiredLength
+				persistence.expiredLength = expiredLength
 			}
 
 			var data []byte
 
 			if validLength > 0 {
-				p.validLength = validLength
+				persistence.validLength = validLength
 
 				data = make([]byte, validLength)
 				copy(data[:], mMap[expiredDataOffset+expiredLength:])
@@ -331,7 +343,7 @@ func (p *persistence) service() {
 			}
 
 			p.syncStream(block)
-			p.encoder.done <- done
+			p.worker.broadcast(done)
 
 			if err := p.Munmap(); err != nil {
 				panic(err)
@@ -374,6 +386,11 @@ func (p *persistence) service() {
 			}
 		case <-p.osSignal:
 			return
+		case *p.worker.addr() = <-p.worker.channel():
+			if p.worker.expect(stop) {
+				p.worker.broadcast(stop)
+				return
+			}
 		}
 	}
 }

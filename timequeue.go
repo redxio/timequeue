@@ -5,6 +5,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -17,13 +18,14 @@ type item struct {
 
 // TimeQueue represents a time queue
 type TimeQueue struct {
-	lock          sync.RWMutex
-	queue         *list.List
-	worker        chan semaphore
-	reconsumption chan semaphore
-	delay         chan interface{}
-	persistent    bool
-	persistence   *persistence
+	lock            sync.RWMutex
+	queue           *list.List
+	worker          *semaphore
+	delay           chan interface{}
+	persistent      bool
+	persistence     *persistence
+	stopTime        time.Time
+	stopPersistence bool
 }
 
 // TravFunc is used for traversing time queue, the argument of TravFunc is Value stored in queue item
@@ -31,6 +33,39 @@ type TravFunc func(interface{})
 
 func (tq *TimeQueue) service() {
 	var releaseRLock bool
+
+	tq.worker.processedSignal(stop, resume)
+	tq.worker.register(stop, func() {
+		tq.lock.RLock()
+
+		if tq.persistent {
+			if tq.queue.Len() > 0 {
+				tq.stopTime = tq.queue.Back().Value.(*node).item.Expire
+			} else {
+				tq.stopTime = time.Now()
+			}
+			tq.persistent = false
+		}
+
+		tq.lock.RUnlock()
+	})
+	tq.worker.register(resume, func() {
+		tq.lock.RLock()
+
+		if !tq.persistent && !tq.stopTime.IsZero() {
+			tq.stopTime = time.Time{}
+			tq.persistent = true
+
+			if tq.stopPersistence {
+				tq.stopPersistence = false
+
+				go tq.persistence.service()
+				go tq.persistence.encoder.service()
+			}
+		}
+
+		tq.lock.RUnlock()
+	})
 
 	for {
 		tq.lock.RLock()
@@ -42,27 +77,35 @@ func (tq *TimeQueue) service() {
 		if tq.queue.Len() == 0 {
 			tq.lock.RUnlock()
 			releaseRLock = true
-			<-tq.worker
+
+			tq.worker.peek(consumption)
+
 			continue
 		}
 
-		if len(tq.reconsumption) > 0 {
-			<-tq.reconsumption
-		}
+		tq.worker.processAvailableSignal()
 
 		if time.Now().Before(tq.queue.Front().Value.(*node).item.Expire) {
 			tq.lock.RUnlock()
 			releaseRLock = true
 
+		here:
 			select {
-			case <-tq.reconsumption:
-				if time.Now().Before(tq.queue.Front().Value.(*node).item.Expire) {
-					continue
+			case *tq.worker.addr() = <-tq.worker.channel():
+
+				switch tq.worker.view() {
+				case reconsumption:
+					if time.Now().Before(tq.queue.Front().Value.(*node).item.Expire) {
+						continue
+					}
+
+				case stop, resume:
+					tq.worker.doAction()
+					goto here
 				}
+
 			case <-time.After(tq.queue.Front().Value.(*node).item.Expire.Sub(time.Now())):
-				if len(tq.reconsumption) > 0 {
-					<-tq.reconsumption
-				}
+				tq.worker.processAvailableSignal()
 			}
 		}
 
@@ -72,9 +115,7 @@ func (tq *TimeQueue) service() {
 
 		tq.lock.Lock()
 
-		if len(tq.reconsumption) > 0 {
-			<-tq.reconsumption
-		}
+		tq.worker.processAvailableSignal()
 
 		for tmp, iter := (*node)(nil), tq.queue.Front(); iter != nil; iter = tq.queue.Front() {
 			tmp = iter.Value.(*node)
@@ -91,8 +132,11 @@ func (tq *TimeQueue) service() {
 			case <-tq.persistence.osSignal:
 				return
 			default:
-				if tq.persistent {
+				if tq.persistent || (!tq.stopTime.IsZero() && (tmp.item.Expire.Before(tq.stopTime) || tmp.item.Expire.Equal(tq.stopTime))) {
 					tq.persistence.expired <- tmp.length
+				} else if !tq.stopPersistence {
+					tq.persistence.worker.send(stop)
+					tq.stopPersistence = true
 				}
 			}
 
@@ -107,10 +151,9 @@ func (tq *TimeQueue) service() {
 // New returns a initialized time queue
 func New() *TimeQueue {
 	tq := &TimeQueue{
-		queue:         list.New(),
-		worker:        make(chan semaphore),
-		reconsumption: make(chan semaphore),
-		persistent:    false,
+		queue:      list.New(),
+		worker:     newSemaphore(1),
+		persistent: false,
 	}
 
 	go tq.service()
@@ -142,7 +185,7 @@ func (tq *TimeQueue) MustPersist(filename string, maxExpired int64, value interf
 func (tq *TimeQueue) insertAndCalculateOffset(n *node, offset *int64) {
 	if front, back := tq.queue.Front(), tq.queue.Back(); front == nil {
 		tq.queue.PushFront(n)
-		tq.worker <- consumption
+		tq.worker.send(consumption)
 	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*node).item.Expire.UnixNano())) <=
 		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*node).item.Expire.UnixNano())) {
 		iter := front
@@ -158,7 +201,7 @@ func (tq *TimeQueue) insertAndCalculateOffset(n *node, offset *int64) {
 		if iter != nil {
 			tq.queue.InsertBefore(n, iter)
 			if iter == front {
-				tq.reconsumption <- reconsumption
+				tq.worker.send(reconsumption)
 			}
 		} else {
 			tq.queue.PushBack(n)
@@ -180,7 +223,7 @@ func (tq *TimeQueue) insertAndCalculateOffset(n *node, offset *int64) {
 			tq.queue.InsertAfter(n, iter)
 		} else {
 			tq.queue.PushFront(n)
-			tq.reconsumption <- reconsumption
+			tq.worker.send(reconsumption)
 		}
 	}
 }
@@ -188,7 +231,7 @@ func (tq *TimeQueue) insertAndCalculateOffset(n *node, offset *int64) {
 func (tq *TimeQueue) insert(n *node) {
 	if front, back := tq.queue.Front(), tq.queue.Back(); front == nil {
 		tq.queue.PushFront(n)
-		tq.worker <- consumption
+		tq.worker.send(consumption)
 	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*node).item.Expire.UnixNano())) <
 		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*node).item.Expire.UnixNano())) {
 		iter := front
@@ -199,7 +242,7 @@ func (tq *TimeQueue) insert(n *node) {
 		if iter != nil {
 			tq.queue.InsertBefore(n, iter)
 			if iter == front {
-				tq.reconsumption <- reconsumption
+				tq.worker.send(reconsumption)
 			}
 		} else {
 			tq.queue.PushBack(n)
@@ -214,7 +257,7 @@ func (tq *TimeQueue) insert(n *node) {
 			tq.queue.InsertAfter(n, iter)
 		} else {
 			tq.queue.PushFront(n)
-			tq.reconsumption <- reconsumption
+			tq.worker.send(reconsumption)
 		}
 	}
 }
@@ -243,10 +286,6 @@ func (tq *TimeQueue) enqueue(n *node) {
 func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	expireTime := time.Now().Add(delay)
 
-	if tq.persistent && reflect.TypeOf(value).Kind() == reflect.Func {
-		panic("unsupported persistent type")
-	}
-
 	if delay <= 0 {
 		if tq.delay != nil {
 			tq.delay <- value
@@ -255,16 +294,24 @@ func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	}
 
 	n := &node{item: item{value, expireTime}}
+
 	tq.lock.Lock()
+
+	if tq.persistent && reflect.TypeOf(value).Kind() == reflect.Func {
+		panic("unsupported persistent type")
+	}
 	tq.enqueue(n)
+
 	tq.lock.Unlock()
+
+	runtime.Gosched()
 }
 
 // Receive returns a received only channel, which can be used for receiving Value left from queue
 func (tq *TimeQueue) Receive() <-chan interface{} {
 	if tq.delay == nil {
 		tq.lock.RLock()
-		tq.delay = make(chan interface{}, 1)
+		tq.delay = make(chan interface{})
 		tq.lock.RUnlock()
 	}
 	return tq.delay
@@ -290,26 +337,65 @@ func (tq *TimeQueue) Traverse() <-chan interface{} {
 // TraverseF traverses time queue tq with function f
 func (tq *TimeQueue) TraverseF(f TravFunc) {
 	tq.lock.RLock()
-	defer tq.lock.RUnlock()
-
-	if f == nil {
-		return
-	}
 
 	for elem := tq.queue.Front(); elem != nil; elem = elem.Next() {
 		f(elem.Value.(*node).item.Value)
 	}
+
+	tq.lock.RUnlock()
 }
 
 // SetMaxExpiredStorage sets maximum expired data in bytes
 func (tq *TimeQueue) SetMaxExpiredStorage(maxExpired int64) {
+	tq.lock.RLock()
+
 	if !tq.persistent {
 		panic("persistence not enabled")
 	}
 	tq.persistence.clean <- maxExpired
+
+	tq.lock.RUnlock()
 }
 
 // Persistent reports whether persistence is enabled
 func (tq *TimeQueue) Persistent() bool {
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
 	return tq.persistent
+}
+
+// Len returns the length of time queue
+func (tq *TimeQueue) Len() int {
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
+	return tq.queue.Len()
+}
+
+// PersistOff turns persistence off
+func (tq *TimeQueue) PersistOff() *TimeQueue {
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
+	if !tq.persistent {
+		return tq
+	}
+	tq.worker.send(stop)
+
+	return tq
+}
+
+// PersistOn turns persistence on
+func (tq *TimeQueue) PersistOn() *TimeQueue {
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
+	if tq.persistent {
+		return tq
+	}
+
+	tq.worker.send(resume)
+
+	return tq
 }
