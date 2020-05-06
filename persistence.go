@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const (
@@ -269,11 +270,49 @@ func (tq *TimeQueue) withPersistence(filename string, maxExpired int64, value in
 		}
 	}
 
+	tq.initWorker()
+
 	go tq.service()
 	go tq.persistence.service()
 	go tq.persistence.encoder.service()
 
 	return nil
+}
+
+func (tq *TimeQueue) initWorker() {
+	tq.worker.processedSignal(stop, resume)
+
+	tq.worker.register(stop, func() {
+		tq.lock.RLock()
+
+		if tq.persistent {
+			if tq.queue.Len() > 0 {
+				tq.stopTime = tq.queue.Back().Value.(*node).item.Expire
+			} else {
+				tq.stopTime = time.Now()
+			}
+			tq.persistent = false
+		}
+
+		tq.lock.RUnlock()
+	})
+	tq.worker.register(resume, func() {
+		tq.lock.RLock()
+
+		if !tq.persistent && !tq.stopTime.IsZero() {
+			tq.stopTime = time.Time{}
+			tq.persistent = true
+
+			if tq.stopPersistence {
+				tq.stopPersistence = false
+
+				go tq.persistence.service()
+				go tq.persistence.encoder.service()
+			}
+		}
+
+		tq.lock.RUnlock()
+	})
 }
 
 func createOrOpenFile(filename string) (*os.File, error) {

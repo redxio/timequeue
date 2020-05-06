@@ -59,10 +59,8 @@ func (sema *semaphore) send(signal internalSignal) *semaphore {
 }
 
 func (sema *semaphore) processedSignal(signals ...internalSignal) *semaphore {
-	if len(sema.processedSignals) > 0 {
-		for k := range sema.processedSignals {
-			delete(sema.processedSignals, k)
-		}
+	for k := range sema.processedSignals {
+		delete(sema.processedSignals, k)
 	}
 
 	for _, signal := range signals {

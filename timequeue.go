@@ -4,10 +4,13 @@ import (
 	"container/list"
 	"errors"
 	"math"
+	"os"
+	"os/signal"
 	"reflect"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -26,6 +29,7 @@ type TimeQueue struct {
 	persistence     *persistence
 	stopTime        time.Time
 	stopPersistence bool
+	osSignal        chan os.Signal
 }
 
 // TravFunc is used for traversing time queue, the argument of TravFunc is Value stored in queue item
@@ -33,39 +37,6 @@ type TravFunc func(interface{})
 
 func (tq *TimeQueue) service() {
 	var releaseRLock bool
-
-	tq.worker.processedSignal(stop, resume)
-	tq.worker.register(stop, func() {
-		tq.lock.RLock()
-
-		if tq.persistent {
-			if tq.queue.Len() > 0 {
-				tq.stopTime = tq.queue.Back().Value.(*node).item.Expire
-			} else {
-				tq.stopTime = time.Now()
-			}
-			tq.persistent = false
-		}
-
-		tq.lock.RUnlock()
-	})
-	tq.worker.register(resume, func() {
-		tq.lock.RLock()
-
-		if !tq.persistent && !tq.stopTime.IsZero() {
-			tq.stopTime = time.Time{}
-			tq.persistent = true
-
-			if tq.stopPersistence {
-				tq.stopPersistence = false
-
-				go tq.persistence.service()
-				go tq.persistence.encoder.service()
-			}
-		}
-
-		tq.lock.RUnlock()
-	})
 
 	for {
 		tq.lock.RLock()
@@ -129,7 +100,7 @@ func (tq *TimeQueue) service() {
 			}
 
 			select {
-			case <-tq.persistence.osSignal:
+			case <-tq.osSignal:
 				return
 			default:
 				if tq.persistent || (!tq.stopTime.IsZero() && (tmp.item.Expire.Before(tq.stopTime) || tmp.item.Expire.Equal(tq.stopTime))) {
@@ -151,10 +122,12 @@ func (tq *TimeQueue) service() {
 // New returns a initialized time queue
 func New() *TimeQueue {
 	tq := &TimeQueue{
-		queue:      list.New(),
-		worker:     newSemaphore(1),
-		persistent: false,
+		queue:    list.New(),
+		worker:   newSemaphore(1),
+		osSignal: make(chan os.Signal, 1),
 	}
+
+	signal.Notify(tq.osSignal, syscall.SIGINT, syscall.SIGTERM)
 
 	go tq.service()
 	return tq
@@ -270,7 +243,7 @@ func (tq *TimeQueue) enqueue(n *node) {
 		tq.insertAndCalculateOffset(n, &block.offset)
 
 		select {
-		case <-tq.persistence.osSignal:
+		case <-tq.osSignal:
 			return
 		default:
 			block.data = <-tq.persistence.encoder.out
@@ -285,17 +258,18 @@ func (tq *TimeQueue) enqueue(n *node) {
 // EnQueue enters time queue, stay in queue for duration delay then leave immediately, it will leave immediately if delay less or equal than 0.
 func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	expireTime := time.Now().Add(delay)
+	n := &node{item: item{value, expireTime}}
+
+	tq.lock.Lock()
 
 	if delay <= 0 {
 		if tq.delay != nil {
 			tq.delay <- value
 		}
+		tq.lock.Unlock()
+
 		return
 	}
-
-	n := &node{item: item{value, expireTime}}
-
-	tq.lock.Lock()
 
 	if tq.persistent && reflect.TypeOf(value).Kind() == reflect.Func {
 		panic("unsupported persistent type")
@@ -394,7 +368,6 @@ func (tq *TimeQueue) PersistOn() *TimeQueue {
 	if tq.persistent {
 		return tq
 	}
-
 	tq.worker.send(resume)
 
 	return tq
