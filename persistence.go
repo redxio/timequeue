@@ -23,7 +23,7 @@ const (
 	expiredDataOffset   = fileMetaInfoLength
 )
 
-type node struct {
+type Node struct {
 	length int64
 	item   item
 }
@@ -287,7 +287,7 @@ func (tq *TimeQueue) initWorker() {
 
 		if tq.persistent {
 			if tq.queue.Len() > 0 {
-				tq.stopTime = tq.queue.Back().Value.(*node).item.Expire
+				tq.stopTime = tq.queue.Back().Value.(*Node).item.Expire
 			} else {
 				tq.stopTime = time.Now()
 			}
@@ -348,7 +348,7 @@ func (tq *TimeQueue) loadData(data []byte) {
 	dec := newBinaryDecoder(r, tq.persistence.value, tq.persistence.registry)
 
 	for {
-		n := &node{}
+		n := &Node{}
 
 		if err = dec.decode(&n.item); err != nil {
 			if err == io.EOF {
