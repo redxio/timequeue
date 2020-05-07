@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,12 +23,13 @@ type TimeQueue struct {
 	lock            sync.RWMutex
 	queue           *list.List
 	worker          *semaphore
-	delay           chan interface{}
+	leave           chan interface{}
 	persistent      bool
 	persistence     *persistence
 	stopTime        time.Time
 	stopPersistence bool
 	osSignal        chan os.Signal
+	receiveBuffer   int
 }
 
 // TravFunc is used for traversing time queue, the argument of TravFunc is Value stored in queue item
@@ -95,8 +95,8 @@ func (tq *TimeQueue) service() {
 				break
 			}
 
-			if tq.delay != nil {
-				tq.delay <- tmp.item.Value
+			if tq.leave != nil {
+				tq.leave <- tmp.item.Value
 			}
 
 			select {
@@ -237,7 +237,7 @@ func (tq *TimeQueue) insert(n *node) {
 
 func (tq *TimeQueue) enqueue(n *node) {
 	if tq.persistent {
-		tq.persistence.encoder.in <- n
+		tq.persistence.encoder.in <- &n.item
 		block := &blockinfo{}
 
 		tq.insertAndCalculateOffset(n, &block.offset)
@@ -263,11 +263,11 @@ func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	tq.lock.Lock()
 
 	if delay <= 0 {
-		if tq.delay != nil {
-			tq.delay <- value
+		if tq.leave != nil {
+			tq.leave <- value
 		}
-		tq.lock.Unlock()
 
+		tq.lock.Unlock()
 		return
 	}
 
@@ -277,18 +277,32 @@ func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	tq.enqueue(n)
 
 	tq.lock.Unlock()
+}
 
-	runtime.Gosched()
+// SetReceiveBuffer sets buffer size for receiving
+func (tq *TimeQueue) SetReceiveBuffer(buf int) *TimeQueue {
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
+	if tq.receiveBuffer != buf {
+		if tq.leave != nil {
+			tq.leave = make(chan interface{}, buf)
+		} else {
+			tq.receiveBuffer = buf
+		}
+	}
+
+	return tq
 }
 
 // Receive returns a received only channel, which can be used for receiving Value left from queue
 func (tq *TimeQueue) Receive() <-chan interface{} {
-	if tq.delay == nil {
-		tq.lock.RLock()
-		tq.delay = make(chan interface{})
-		tq.lock.RUnlock()
-	}
-	return tq.delay
+	tq.lock.RLock()
+	defer tq.lock.RUnlock()
+
+	tq.leave = make(chan interface{}, tq.receiveBuffer)
+
+	return tq.leave
 }
 
 // Traverse returns a received only channel, which can be used to receive traversing result
@@ -311,24 +325,22 @@ func (tq *TimeQueue) Traverse() <-chan interface{} {
 // TraverseF traverses time queue tq with function f
 func (tq *TimeQueue) TraverseF(f TravFunc) {
 	tq.lock.RLock()
+	defer tq.lock.RUnlock()
 
 	for elem := tq.queue.Front(); elem != nil; elem = elem.Next() {
 		f(elem.Value.(*node).item.Value)
 	}
-
-	tq.lock.RUnlock()
 }
 
 // SetMaxExpiredStorage sets maximum expired data in bytes
 func (tq *TimeQueue) SetMaxExpiredStorage(maxExpired int64) {
 	tq.lock.RLock()
+	defer tq.lock.RUnlock()
 
 	if !tq.persistent {
 		panic("persistence not enabled")
 	}
 	tq.persistence.clean <- maxExpired
-
-	tq.lock.RUnlock()
 }
 
 // Persistent reports whether persistence is enabled

@@ -7,7 +7,7 @@ import (
 type encoder struct {
 	binaryEncoder *binaryEncoder
 	buf           *bytes.Buffer
-	in            chan *node
+	in            chan *item
 	out           chan []byte
 	worker        *semaphore
 }
@@ -18,7 +18,7 @@ func newEncoder() *encoder {
 	return &encoder{
 		binaryEncoder: newBinaryEncoder(buf),
 		buf:           buf,
-		in:            make(chan *node),
+		in:            make(chan *item),
 		out:           make(chan []byte),
 	}
 }
@@ -27,8 +27,8 @@ func (enc *encoder) service() {
 
 	for {
 		select {
-		case n := <-enc.in:
-			if err := enc.binaryEncoder.encode(n.item); err != nil {
+		case item := <-enc.in:
+			if err := enc.binaryEncoder.encode(item); err != nil {
 				panic(err)
 			}
 
