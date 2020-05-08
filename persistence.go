@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -372,6 +373,8 @@ func (tq *TimeQueue) loadData(data []byte) {
 }
 
 func (p *persistence) service() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 
 	for {
 		select {

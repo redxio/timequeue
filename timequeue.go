@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"reflect"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -36,6 +37,9 @@ type TimeQueue struct {
 type TravFunc func(interface{})
 
 func (tq *TimeQueue) service() {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	var releaseRLock bool
 
 	for {
