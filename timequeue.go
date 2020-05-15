@@ -30,7 +30,6 @@ type TimeQueue struct {
 	stopTime        time.Time
 	stopPersistence bool
 	osSignal        chan os.Signal
-	receiveBuffer   int
 }
 
 // TravFunc is used for traversing time queue, the argument of TravFunc is Value stored in queue item
@@ -60,7 +59,7 @@ func (tq *TimeQueue) service() {
 
 		tq.worker.processAvailableSignal()
 
-		if time.Now().Before(tq.queue.Front().Value.(*Node).item.Expire) {
+		if time.Now().Before(tq.queue.Front().Value.(*node).item.Expire) {
 			tq.lock.RUnlock()
 			releaseRLock = true
 
@@ -70,7 +69,7 @@ func (tq *TimeQueue) service() {
 
 				switch tq.worker.view() {
 				case reconsumption:
-					if time.Now().Before(tq.queue.Front().Value.(*Node).item.Expire) {
+					if time.Now().Before(tq.queue.Front().Value.(*node).item.Expire) {
 						continue
 					}
 
@@ -79,7 +78,7 @@ func (tq *TimeQueue) service() {
 					goto here
 				}
 
-			case <-time.After(tq.queue.Front().Value.(*Node).item.Expire.Sub(time.Now())):
+			case <-time.After(tq.queue.Front().Value.(*node).item.Expire.Sub(time.Now())):
 				tq.worker.processAvailableSignal()
 			}
 		}
@@ -92,8 +91,8 @@ func (tq *TimeQueue) service() {
 
 		tq.worker.processAvailableSignal()
 
-		for tmp, iter := (*Node)(nil), tq.queue.Front(); iter != nil; iter = tq.queue.Front() {
-			tmp = iter.Value.(*Node)
+		for tmp, iter := (*node)(nil), tq.queue.Front(); iter != nil; iter = tq.queue.Front() {
+			tmp = iter.Value.(*node)
 
 			if tmp.item.Expire.After(time.Now()) {
 				break
@@ -159,15 +158,15 @@ func (tq *TimeQueue) MustPersist(filename string, maxExpired int64, value interf
 	return tq
 }
 
-func (tq *TimeQueue) insertAndCalculateOffset(n *Node, offset *int64) {
+func (tq *TimeQueue) insertAndCalculateOffset(n *node, offset *int64) {
 	if front, back := tq.queue.Front(), tq.queue.Back(); front == nil {
 		tq.queue.PushFront(n)
 		tq.worker.send(consumption)
-	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*Node).item.Expire.UnixNano())) <=
-		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*Node).item.Expire.UnixNano())) {
+	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*node).item.Expire.UnixNano())) <=
+		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*node).item.Expire.UnixNano())) {
 		iter := front
-		for tmp := (*Node)(nil); iter != nil; iter = iter.Next() {
-			tmp = iter.Value.(*Node)
+		for tmp := (*node)(nil); iter != nil; iter = iter.Next() {
+			tmp = iter.Value.(*node)
 
 			if n.item.Expire.Before(tmp.item.Expire) {
 				break
@@ -185,8 +184,8 @@ func (tq *TimeQueue) insertAndCalculateOffset(n *Node, offset *int64) {
 		}
 	} else {
 		iter := back
-		for tmp := (*Node)(nil); iter != nil; iter = iter.Prev() {
-			tmp = iter.Value.(*Node)
+		for tmp := (*node)(nil); iter != nil; iter = iter.Prev() {
+			tmp = iter.Value.(*node)
 
 			if n.item.Expire.After(tmp.item.Expire) {
 				break
@@ -205,14 +204,14 @@ func (tq *TimeQueue) insertAndCalculateOffset(n *Node, offset *int64) {
 	}
 }
 
-func (tq *TimeQueue) insert(n *Node) {
+func (tq *TimeQueue) insert(n *node) {
 	if front, back := tq.queue.Front(), tq.queue.Back(); front == nil {
 		tq.queue.PushFront(n)
 		tq.worker.send(consumption)
-	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*Node).item.Expire.UnixNano())) <
-		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*Node).item.Expire.UnixNano())) {
+	} else if math.Abs(float64(n.item.Expire.UnixNano()-front.Value.(*node).item.Expire.UnixNano())) <
+		math.Abs(float64(n.item.Expire.UnixNano()-back.Value.(*node).item.Expire.UnixNano())) {
 		iter := front
-		for iter != nil && n.item.Expire.After(iter.Value.(*Node).item.Expire) {
+		for iter != nil && n.item.Expire.After(iter.Value.(*node).item.Expire) {
 			iter = iter.Next()
 		}
 
@@ -226,7 +225,7 @@ func (tq *TimeQueue) insert(n *Node) {
 		}
 	} else {
 		iter := back
-		for iter != nil && n.item.Expire.Before(iter.Value.(*Node).item.Expire) {
+		for iter != nil && n.item.Expire.Before(iter.Value.(*node).item.Expire) {
 			iter = iter.Prev()
 		}
 
@@ -239,7 +238,7 @@ func (tq *TimeQueue) insert(n *Node) {
 	}
 }
 
-func (tq *TimeQueue) enqueue(n *Node) {
+func (tq *TimeQueue) enqueue(n *node) {
 	if tq.persistent {
 		tq.persistence.encoder.in <- &n.item
 		block := &blockinfo{}
@@ -262,7 +261,7 @@ func (tq *TimeQueue) enqueue(n *Node) {
 // EnQueue enters time queue, stay in queue for duration delay then leave immediately, it will leave immediately if delay less or equal than 0.
 func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	expireTime := time.Now().Add(delay)
-	n := &Node{item: item{value, expireTime}}
+	n := &node{item: item{value, expireTime}}
 
 	tq.lock.Lock()
 
@@ -283,28 +282,15 @@ func (tq *TimeQueue) EnQueue(value interface{}, delay time.Duration) {
 	tq.lock.Unlock()
 }
 
-// SetReceiveBuffer sets buffer size for receiving
-func (tq *TimeQueue) SetReceiveBuffer(buf int) *TimeQueue {
-	tq.lock.RLock()
-	defer tq.lock.RUnlock()
-
-	if tq.receiveBuffer != buf {
-		if tq.leave != nil {
-			tq.leave = make(chan interface{}, buf)
-		} else {
-			tq.receiveBuffer = buf
-		}
-	}
-
-	return tq
-}
-
 // Receive returns a received only channel, which can be used for receiving Value left from queue
-func (tq *TimeQueue) Receive() <-chan interface{} {
-	tq.lock.RLock()
-	defer tq.lock.RUnlock()
+func (tq *TimeQueue) Receive(buf int) <-chan interface{} {
+	tq.lock.Lock()
+	defer tq.lock.Unlock()
 
-	tq.leave = make(chan interface{}, tq.receiveBuffer)
+	if tq.leave != nil {
+		return tq.leave
+	}
+	tq.leave = make(chan interface{}, buf)
 
 	return tq.leave
 }
@@ -319,7 +305,7 @@ func (tq *TimeQueue) Traverse() <-chan interface{} {
 		defer close(ch)
 
 		for elem := tq.queue.Front(); elem != nil; elem = elem.Next() {
-			ch <- elem.Value.(*Node).item.Value
+			ch <- elem.Value.(*node).item.Value
 		}
 	}()
 
@@ -332,7 +318,7 @@ func (tq *TimeQueue) TraverseF(f TravFunc) {
 	defer tq.lock.RUnlock()
 
 	for elem := tq.queue.Front(); elem != nil; elem = elem.Next() {
-		f(elem.Value.(*Node).item.Value)
+		f(elem.Value.(*node).item.Value)
 	}
 }
 
@@ -386,10 +372,5 @@ func (tq *TimeQueue) PersistOn() *TimeQueue {
 	}
 	tq.worker.send(resume)
 
-	return tq
-}
-
-// UseIndex uses custom index
-func (tq *TimeQueue) UseIndex(index Indexer) *TimeQueue {
 	return tq
 }
